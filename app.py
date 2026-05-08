@@ -1,271 +1,807 @@
+# =========================================================
+# IMPORTS
+# =========================================================
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+import plotly.express as px
+import plotly.graph_objects as go
 import numpy as np
-from collections import Counter
 import io
-import os
 
-st.set_page_config(page_title="Network IDS Dashboard", layout="wide")
+from datetime import datetime
 
-# ===============================
-# Styling
-# ===============================
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+
+
+# =========================================================
+# PAGE CONFIG
+# =========================================================
+st.set_page_config(
+    page_title="SentinelX NIDS",
+    layout="wide"
+)
+
+# =========================================================
+# UI STYLING
+# =========================================================
 st.markdown("""
 <style>
-    .main { background-color: #0a1628; }
-    .stMetric { background-color: #112240; border-radius: 10px; padding: 10px; }
-    h1 { color: #00bcd4; }
-    h2, h3 { color: #e8f4fd; }
+
+html, body, [class*="css"] {
+    font-family: "Inter", sans-serif;
+    background-color: #0b1220;
+    color: #e5e7eb;
+}
+
+.main {
+    background-color: #0b1220;
+}
+
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 1rem;
+    padding-left: 2rem;
+    padding-right: 2rem;
+}
+
+/* =====================================================
+SIDEBAR
+===================================================== */
+section[data-testid="stSidebar"] {
+    background-color: #111827;
+    border-right: 1px solid #1f2937;
+}
+
+section[data-testid="stSidebar"] * {
+    color: #e5e7eb !important;
+}
+
+/* =====================================================
+UPLOAD BUTTON FIX
+===================================================== */
+
+[data-testid="stFileUploaderDropzone"] {
+    background-color: #1f2937 !important;
+    border: 2px dashed #3b82f6 !important;
+}
+
+[data-testid="stFileUploaderDropzone"] * {
+    color: #e5e7eb !important;
+}
+
+/* =====================================================
+HEADERS
+===================================================== */
+h1 {
+    color: #f9fafb;
+    font-size: 2.4rem;
+    font-weight: 700;
+}
+
+h2, h3 {
+    color: #f3f4f6;
+    font-weight: 600;
+}
+
+/* =====================================================
+METRIC CARDS
+===================================================== */
+div[data-testid="metric-container"] {
+
+    background: linear-gradient(
+        145deg,
+        #111827,
+        #0f172a
+    ) !important;
+
+    border: 1px solid rgba(59, 130, 246, 0.18) !important;
+
+    border-radius: 18px !important;
+
+    padding: 22px 18px !important;
+
+    box-shadow:
+        0 0 0 1px rgba(255,255,255,0.03),
+        0 6px 18px rgba(0,0,0,0.28) !important;
+}
+
+/* =====================================================
+TABLES
+===================================================== */
+[data-testid="stDataFrame"] {
+    border: 1px solid #1f2937;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+/* =====================================================
+BUTTONS
+===================================================== */
+.stDownloadButton button {
+    background-color: #2563eb;
+    color: white;
+    border-radius: 8px;
+    border: none;
+    padding: 0.5rem 1rem;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🚨 Network Intrusion Detection Dashboard")
-st.caption("Wireshark-based Packet-Level Anomaly Detection | Real-time NIDS Demo")
+# =========================================================
+# HEADER
+# =========================================================
+st.title("SentinelX NIDS")
 
-# ===============================
-# Sidebar — Upload or use sample
-# ===============================
-st.sidebar.header("📂 Data Source")
-mode = st.sidebar.radio("Choose input", ["Use sample data (demo)", "Upload attack.csv"])
+st.caption(
+    "Real-time packet anomaly monitoring and intrusion detection system"
+)
 
-def generate_sample_data():
-    """Generate realistic demo data: baseline + port scan burst + large packet burst"""
+# =========================================================
+# STATUS BAR
+# =========================================================
+colA, colB = st.columns([5, 1])
+
+with colA:
+
+    st.caption(
+        f"Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+with colB:
+
+    st.success("Operational")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+st.sidebar.header("Detection Settings")
+
+# LOWERED THRESHOLD FOR REALISTIC WIRESHARK DEMOS
+spike_threshold = st.sidebar.slider(
+    "Traffic Spike Threshold (pps)",
+    min_value=20,
+    max_value=500,
+    value=80,
+    step=5
+)
+
+mode = st.sidebar.radio(
+    "Select Input",
+    [
+        "Normal Traffic Demo",
+        "Attack Traffic Demo",
+        "Upload attack.csv"
+    ]
+)
+
+# =========================================================
+# NORMAL DATA
+# =========================================================
+@st.cache_data
+def generate_normal_data():
+
     np.random.seed(42)
+
     rows = []
+
     base_time = 1700000000.0
-    ips = ["192.168.1.5", "192.168.1.10", "192.168.1.20", "10.0.0.5"]
 
-    # Normal traffic (0–30s)
-    for i in range(800):
-        t = base_time + np.random.uniform(0, 30)
-        src = np.random.choice(ips)
-        dst = np.random.choice(["192.168.1.1", "8.8.8.8", "142.250.1.1"])
-        sport = np.random.randint(49152, 65535)
-        dport = np.random.choice([80, 443, 53, 22, 8080])
-        length = np.random.randint(60, 800)
-        rows.append([round(t, 3), src, dst, sport, dport, length])
+    ips = [
+        "192.168.1.5",
+        "192.168.1.10",
+        "192.168.1.20",
+        "10.0.0.5"
+    ]
 
-    # Port scan burst (30–35s) — attacker hits 500 ports
-    attacker = "192.168.1.99"
-    for port in range(1, 501):
-        t = base_time + 30 + port * 0.01
-        rows.append([round(t, 3), attacker, "192.168.1.1", 54321, port, 60])
+    for i in range(2000):
 
-    # Traffic spike (35–40s) — DDoS simulation
-    for i in range(1500):
-        t = base_time + 35 + np.random.uniform(0, 5)
-        src = f"10.0.{np.random.randint(0,255)}.{np.random.randint(1,254)}"
-        rows.append([round(t, 3), src, "192.168.1.1", np.random.randint(1024,65535), 80, np.random.randint(60,200)])
+        rows.append([
+            round(base_time + np.random.uniform(0, 60), 3),
+            np.random.choice(ips),
+            np.random.choice([
+                "192.168.1.1",
+                "8.8.8.8",
+                "142.250.1.1"
+            ]),
+            np.random.randint(49152, 65535),
+            np.random.choice([80, 443, 53, 22]),
+            np.random.randint(60, 700)
+        ])
 
-    # Large packets (40–50s) — data exfiltration simulation
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "time",
+            "src_ip",
+            "dst_ip",
+            "src_port",
+            "dst_port",
+            "length"
+        ]
+    )
+
+# =========================================================
+# ATTACK DATA
+# =========================================================
+@st.cache_data
+def generate_attack_data():
+
+    df = generate_normal_data()
+
+    rows = []
+
+    base_time = 1700000030
+
+    # PORT SCAN
+    for port in range(1, 500):
+
+        rows.append([
+            base_time + port * 0.01,
+            "192.168.1.99",
+            "192.168.1.1",
+            55555,
+            port,
+            60
+        ])
+
+    # SYN FLOOD
+    for i in range(1000):
+
+        rows.append([
+            base_time + np.random.uniform(0, 2),
+            "10.10.10.10",
+            "192.168.1.1",
+            np.random.randint(1000,65535),
+            80,
+            60
+        ])
+
+    # DATA EXFIL
     for i in range(80):
-        t = base_time + 40 + i * 0.1
-        rows.append([round(t, 3), "192.168.1.5", "203.0.113.1", 54000+i, 443, np.random.randint(1300, 1500)])
 
-    # More normal traffic (50–60s)
-    for i in range(400):
-        t = base_time + 50 + np.random.uniform(0, 10)
-        src = np.random.choice(ips)
-        dst = np.random.choice(["192.168.1.1", "8.8.8.8"])
-        rows.append([round(t, 3), src, dst, np.random.randint(49152,65535), np.random.choice([80,443,53]), np.random.randint(60,600)])
+        rows.append([
+            base_time + 10 + i * 0.1,
+            "192.168.1.5",
+            "203.0.113.1",
+            54000+i,
+            4444,
+            np.random.randint(1300, 1800)
+        ])
 
-    df = pd.DataFrame(rows, columns=["time","src_ip","dst_ip","src_port","dst_port","length"])
-    return df.sort_values("time").reset_index(drop=True)
+    attack_df = pd.DataFrame(
+        rows,
+        columns=df.columns
+    )
 
-# ===============================
-# Load Data
-# ===============================
-df_raw = None
+    return pd.concat(
+        [df, attack_df],
+        ignore_index=True
+    )
 
+# =========================================================
+# LOAD DATA
+# =========================================================
 if mode == "Upload attack.csv":
-    uploaded = st.sidebar.file_uploader("Upload attack.csv", type=["csv","txt"])
+
+    uploaded = st.sidebar.file_uploader(
+        "Upload CSV",
+        type=["csv", "txt"]
+    )
+
     if uploaded:
-        try:
-            df_raw = pd.read_csv(uploaded, sep="\t", header=None)
-        except Exception as e:
-            st.error(f"Failed to read file: {e}")
-            st.stop()
+
+        df_raw = pd.read_csv(
+            uploaded,
+            sep=None,
+            engine="python",
+            header=None
+        )
+
+        df_raw.columns = [
+            "time",
+            "src_ip",
+            "dst_ip",
+            "src_port",
+            "dst_port",
+            "length"
+        ]
+
     else:
-        st.info("👈 Upload your attack.csv file from tshark export, or switch to sample data.")
+
+        st.info("Upload attack.csv")
         st.stop()
+
+elif mode == "Normal Traffic Demo":
+
+    df_raw = generate_normal_data()
+
 else:
-    df_raw = generate_sample_data()
-    st.sidebar.success("✅ Using generated demo data (3,280 packets)")
 
-# ===============================
-# Data Processing
-# ===============================
+    df_raw = generate_attack_data()
+
+# =========================================================
+# PROCESS DATA
+# =========================================================
 df = df_raw.copy()
-if df.shape[1] != 6:
-    st.error(f"Expected 6 columns, got {df.shape[1]}. Check your CSV format.")
-    st.stop()
 
-df.columns = ["time", "src_ip", "dst_ip", "src_port", "dst_port", "length"]
+numeric_cols = [
+    "time",
+    "src_port",
+    "dst_port",
+    "length"
+]
 
-df["time"]     = pd.to_numeric(df["time"],     errors="coerce")
-df["dst_port"] = pd.to_numeric(df["dst_port"], errors="coerce")
-df["length"]   = pd.to_numeric(df["length"],   errors="coerce")
+for col in numeric_cols:
+
+    df[col] = pd.to_numeric(
+        df[col],
+        errors="coerce"
+    )
+
 df = df.dropna()
-df["time"] = pd.to_datetime(df["time"], unit="s")
-df = df.set_index("time").sort_index()
 
-# ===============================
-# Detections
-# ===============================
-port_scan   = df.groupby("src_ip")["dst_port"].nunique()
-suspects    = port_scan[port_scan > 50].reset_index()
-suspects.columns = ["IP Address", "Unique Ports Scanned"]
+df["time"] = pd.to_datetime(
+    df["time"],
+    unit="s"
+)
 
-pps         = df.resample("1s").size()
-spikes      = pps[pps > 100]
+df = df.sort_values("time")
 
-large       = df[df["length"] > 1200]
-talkers     = df["src_ip"].value_counts().head(10)
+# =========================================================
+# FLOW FEATURES
+# =========================================================
+flow_df = (
+    df.groupby("src_ip")
+    .agg(
+        packet_count=("length", "count"),
+        avg_packet_size=("length", "mean"),
+        max_packet_size=("length", "max"),
+        unique_dst_ports=("dst_port", "nunique"),
+        avg_dst_port=("dst_port", "mean"),
+        std_packet_size=("length", "std")
+    )
+    .reset_index()
+)
 
-# ===============================
-# Sidebar — Thresholds
-# ===============================
-st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Detection Thresholds")
-port_thresh  = st.sidebar.slider("Port scan threshold (unique ports)", 10, 200, 50)
-spike_thresh = st.sidebar.slider("Traffic spike threshold (pps)", 20, 500, 100)
-pkt_thresh   = st.sidebar.slider("Large packet threshold (bytes)", 500, 1500, 1200)
+flow_df["std_packet_size"] = (
+    flow_df["std_packet_size"]
+    .fillna(0)
+)
 
-suspects = port_scan[port_scan > port_thresh].reset_index()
-suspects.columns = ["IP Address", "Unique Ports Scanned"]
-pps      = df.resample("1s").size()
-spikes   = pps[pps > spike_thresh]
-large    = df[df["length"] > pkt_thresh]
+# =========================================================
+# FEATURES
+# =========================================================
+features = flow_df[
+    [
+        "packet_count",
+        "avg_packet_size",
+        "max_packet_size",
+        "unique_dst_ports",
+        "avg_dst_port",
+        "std_packet_size"
+    ]
+]
 
-# ===============================
-# Metrics Row
-# ===============================
-st.markdown("### 📊 Overview")
+# =========================================================
+# SCALING
+# =========================================================
+scaler = StandardScaler()
+
+X_scaled = scaler.fit_transform(features)
+
+# =========================================================
+# ISOLATION FOREST
+# =========================================================
+model = IsolationForest(
+    n_estimators=200,
+    contamination=0.01,
+    random_state=42
+)
+
+flow_df["prediction"] = model.fit_predict(X_scaled)
+
+# =========================================================
+# ANOMALIES
+# =========================================================
+anomalies = flow_df[
+    flow_df["prediction"] == -1
+]
+
+# =========================================================
+# SUSPICIOUS HOSTS
+# =========================================================
+suspects = anomalies.rename(
+    columns={
+        "src_ip": "IP Address",
+        "packet_count": "Packets",
+        "unique_dst_ports": "Unique Ports",
+        "avg_packet_size": "Avg Packet Size"
+    }
+)[
+    [
+        "IP Address",
+        "Packets",
+        "Unique Ports",
+        "Avg Packet Size"
+    ]
+]
+
+# =========================================================
+# TRAFFIC SPIKES
+# =========================================================
+pps = (
+    df.set_index("time")
+    .resample("1s")
+    .size()
+)
+
+spikes = pps[
+    pps >= spike_threshold
+]
+
+# =========================================================
+# SYN FLOOD STYLE
+# =========================================================
+small_packets = df[
+    df["length"] <= 70
+]
+
+syn_flood = (
+    small_packets
+    .groupby(["src_ip", "dst_port"])
+    .size()
+    .reset_index(name="packet_count")
+)
+
+syn_flood = syn_flood[
+    syn_flood["packet_count"] >= 400
+]
+
+# =========================================================
+# LARGE PAYLOADS
+# =========================================================
+large = df[
+    df["length"] >= 1200
+]
+
+# =========================================================
+# SUSPICIOUS PORTS
+# =========================================================
+suspicious_ports = [
+    4444,
+    5555,
+    6666,
+    1337,
+    31337
+]
+
+malicious_port_activity = df[
+    df["dst_port"].isin(suspicious_ports)
+]
+
+# =========================================================
+# TOP TALKERS
+# =========================================================
+talkers = df["src_ip"].value_counts().head(10)
+
+# =========================================================
+# SMART GLOBAL SEVERITY
+# =========================================================
+critical = False
+warning = False
+
+# CRITICAL
+if len(suspects) >= 2:
+    critical = True
+
+if len(syn_flood) >= 1:
+    critical = True
+
+if len(spikes) >= 5:
+    critical = True
+
+# WARNING
+if len(suspects) == 1:
+    warning = True
+
+if len(large) >= 5:
+    warning = True
+
+if len(malicious_port_activity) >= 3:
+    warning = True
+
+# FINAL STATUS
+if critical:
+
+    st.error(
+        "🔴 CRITICAL: Active malicious network behavior detected"
+    )
+
+elif warning:
+
+    st.warning(
+        "🟡 WARNING: Suspicious network activity observed"
+    )
+
+else:
+
+    st.success(
+        "🟢 CLEAN: No suspicious activity detected"
+    )
+
+# =========================================================
+# METRICS
+# =========================================================
+st.subheader("Network Overview")
+
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total Packets",        f"{len(df):,}")
-c2.metric("Traffic Spikes",       len(spikes),   delta=f">{spike_thresh} pps", delta_color="inverse")
-c3.metric("Port Scan Suspects",   len(suspects), delta=f">{port_thresh} ports", delta_color="inverse")
-c4.metric("Large Packets",        len(large),    delta=f">{pkt_thresh} bytes", delta_color="inverse")
 
-st.markdown("---")
+c1.metric(
+    "Packets Analyzed",
+    f"{len(df):,}"
+)
 
-# ===============================
-# Row 1: Traffic + Top Talkers
-# ===============================
+c2.metric(
+    "Traffic Anomalies",
+    len(spikes)
+)
+
+c3.metric(
+    "Suspicious Hosts",
+    len(suspects)
+)
+
+c4.metric(
+    "Oversized Payloads",
+    len(large)
+)
+
+# =========================================================
+# CHARTS
+# =========================================================
 left, right = st.columns([2, 1])
 
 with left:
-    st.subheader("📈 Packets per Second (with anomaly markers)")
-    fig, ax = plt.subplots(figsize=(10, 4))
-    fig.patch.set_facecolor("#0a1628")
-    ax.set_facecolor("#112240")
-    ax.plot(pps.index, pps.values, color="#00bcd4", linewidth=1.8, label="PPS")
-    if not spikes.empty:
-        ax.scatter(spikes.index, spikes.values, color="#ff5252", s=60, zorder=5, label=f"Spike (>{spike_thresh})")
-    ax.axhline(spike_thresh, color="#ffd740", linewidth=1, linestyle="--", alpha=0.7, label="Threshold")
-    ax.set_xlabel("Time", color="#90a4ae")
-    ax.set_ylabel("Packets/sec", color="#90a4ae")
-    ax.tick_params(colors="#90a4ae")
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
-    plt.xticks(rotation=30)
-    ax.legend(facecolor="#112240", labelcolor="#e8f4fd", fontsize=9)
-    ax.grid(True, color="#1e3a5f", linewidth=0.5)
-    for spine in ax.spines.values():
-        spine.set_edgecolor("#1e3a5f")
-    st.pyplot(fig)
-    plt.close()
+
+    st.subheader("Traffic Activity Timeline")
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=pps.index,
+        y=pps.values,
+        mode="lines",
+        line=dict(
+            color="#3b82f6",
+            width=2
+        )
+    ))
+
+    fig.add_hline(
+        y=spike_threshold,
+        line_dash="dash",
+        line_color="#f59e0b"
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=400,
+        paper_bgcolor="#111827",
+        plot_bgcolor="#111827"
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
 
 with right:
-    st.subheader("🗣️ Top Talkers (src IP)")
-    fig2, ax2 = plt.subplots(figsize=(5, 4))
-    fig2.patch.set_facecolor("#0a1628")
-    ax2.set_facecolor("#112240")
-    colors = ["#ff5252" if ip == (suspects["IP Address"].iloc[0] if not suspects.empty else "") else "#00bcd4"
-              for ip in talkers.index]
-    ax2.barh(talkers.index[::-1], talkers.values[::-1], color=colors[::-1])
-    ax2.set_xlabel("Packet Count", color="#90a4ae")
-    ax2.tick_params(colors="#90a4ae", labelsize=9)
-    ax2.grid(True, axis="x", color="#1e3a5f", linewidth=0.5)
-    for spine in ax2.spines.values():
-        spine.set_edgecolor("#1e3a5f")
-    st.pyplot(fig2)
-    plt.close()
 
-st.markdown("---")
+    st.subheader("Top Source Hosts")
 
-# ===============================
-# Row 2: Port Scan + Packet Length
-# ===============================
+    talkers_df = pd.DataFrame({
+        "IP": talkers.index,
+        "Packets": talkers.values
+    })
+
+    fig2 = px.bar(
+        talkers_df,
+        x="Packets",
+        y="IP",
+        orientation="h",
+        template="plotly_dark"
+    )
+
+    fig2.update_layout(
+        paper_bgcolor="#111827",
+        plot_bgcolor="#111827"
+    )
+
+    st.plotly_chart(
+        fig2,
+        use_container_width=True
+    )
+
+# =========================================================
+# ANALYSIS
+# =========================================================
 left2, right2 = st.columns(2)
 
 with left2:
-    st.subheader("🚨 Port Scan Detection")
-    if not suspects.empty:
-        st.error(f"⚠️ {len(suspects)} suspicious IP(s) detected scanning >{port_thresh} ports")
-        st.dataframe(suspects, use_container_width=True, hide_index=True)
-        # Bar chart of scanned ports per suspect
-        fig3, ax3 = plt.subplots(figsize=(6, 3))
-        fig3.patch.set_facecolor("#0a1628")
-        ax3.set_facecolor("#112240")
-        ax3.bar(suspects["IP Address"], suspects["Unique Ports Scanned"], color="#ff5252")
-        ax3.set_ylabel("Unique Ports", color="#90a4ae")
-        ax3.tick_params(colors="#90a4ae", labelsize=8)
-        ax3.axhline(port_thresh, color="#ffd740", linewidth=1, linestyle="--", alpha=0.8)
-        for spine in ax3.spines.values():
-            spine.set_edgecolor("#1e3a5f")
-        st.pyplot(fig3)
-        plt.close()
-    else:
-        st.success("✅ No port scan activity detected")
+
+    st.subheader("ML-Based Threat Analysis")
+
+    if len(suspects) > 0:
+
+        st.warning(
+            "Anomalous hosts detected by Isolation Forest"
+        )
+
+        st.dataframe(
+            suspects,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    if len(syn_flood) > 0:
+
+        st.error(
+            "Potential SYN Flood detected"
+        )
+
+        st.dataframe(
+            syn_flood,
+            use_container_width=True,
+            hide_index=True
+        )
+
+    if len(malicious_port_activity) > 0:
+
+        st.warning(
+            "Suspicious ports detected"
+        )
+
+        show_ports = malicious_port_activity.copy()
+
+        show_ports["time"] = (
+            show_ports["time"]
+            .dt.strftime("%H:%M:%S.%f")
+            .str[:-3]
+        )
+
+        st.dataframe(
+            show_ports[
+                [
+                    "time",
+                    "src_ip",
+                    "dst_ip",
+                    "src_port",
+                    "dst_port",
+                    "length"
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True
+        )
+
+    if (
+        len(suspects) == 0
+        and len(syn_flood) == 0
+        and len(malicious_port_activity) == 0
+    ):
+
+        st.success(
+            "No suspicious activity detected"
+        )
 
 with right2:
-    st.subheader("📦 Packet Length Distribution")
-    fig4, ax4 = plt.subplots(figsize=(6, 3))
-    fig4.patch.set_facecolor("#0a1628")
-    ax4.set_facecolor("#112240")
-    ax4.hist(df["length"], bins=40, color="#00897b", edgecolor="#0a1628", linewidth=0.3)
-    ax4.axvline(pkt_thresh, color="#ff5252", linewidth=1.5, linestyle="--", label=f"Threshold ({pkt_thresh}B)")
-    ax4.set_xlabel("Packet Length (bytes)", color="#90a4ae")
-    ax4.set_ylabel("Count", color="#90a4ae")
-    ax4.tick_params(colors="#90a4ae")
-    ax4.legend(facecolor="#112240", labelcolor="#e8f4fd", fontsize=9)
-    ax4.grid(True, color="#1e3a5f", linewidth=0.5)
-    for spine in ax4.spines.values():
-        spine.set_edgecolor("#1e3a5f")
-    st.pyplot(fig4)
-    plt.close()
 
-st.markdown("---")
+    st.subheader("Packet Size Distribution")
 
-# ===============================
-# Large Packets Table
-# ===============================
-st.subheader("📦 Large Packet Records (potential exfiltration)")
-if not large.empty:
-    st.warning(f"{len(large)} packets exceed {pkt_thresh} bytes")
-    show = large[["src_ip","dst_ip","src_port","dst_port","length"]].reset_index()
-    show["time"] = show["time"].dt.strftime("%H:%M:%S.%f").str[:-3]
-    st.dataframe(show.head(20), use_container_width=True, hide_index=True)
+    fig4 = px.histogram(
+        df,
+        x="length",
+        nbins=40,
+        template="plotly_dark"
+    )
+
+    fig4.add_vline(
+        x=1200,
+        line_dash="dash",
+        line_color="#ef4444"
+    )
+
+    fig4.update_layout(
+        paper_bgcolor="#111827",
+        plot_bgcolor="#111827",
+        height=300
+    )
+
+    st.plotly_chart(
+        fig4,
+        use_container_width=True
+    )
+
+# =========================================================
+# SUSPICIOUS PAYLOAD EVENTS
+# =========================================================
+st.subheader("Suspicious Payload Events")
+
+if len(large) > 0:
+
+    st.warning(
+        "Oversized payload traffic identified"
+    )
+
+    row_limit = st.selectbox(
+        "Rows to display",
+        [10, 20, 50, 100],
+        index=1
+    )
+
+    show = large.copy()
+
+    show["time"] = (
+        show["time"]
+        .dt.strftime("%H:%M:%S.%f")
+        .str[:-3]
+    )
+
+    st.dataframe(
+        show[
+            [
+                "time",
+                "src_ip",
+                "dst_ip",
+                "src_port",
+                "dst_port",
+                "length"
+            ]
+        ].head(row_limit),
+        use_container_width=True,
+        hide_index=True
+    )
+
 else:
-    st.success("No oversized packets found")
 
-st.markdown("---")
+    st.success(
+        "No oversized payload events detected"
+    )
 
-# ===============================
-# Raw Data + Download
-# ===============================
-with st.expander("🔍 Raw packet data"):
-    st.dataframe(df.reset_index().head(100), use_container_width=True)
+# =========================================================
+# RAW DATA
+# =========================================================
+with st.expander("Packet Telemetry"):
 
+    st.dataframe(
+        df.head(100),
+        use_container_width=True
+    )
+
+# =========================================================
+# DOWNLOAD
+# =========================================================
 csv_buf = io.StringIO()
-df.reset_index().to_csv(csv_buf, index=False)
+
+df.to_csv(
+    csv_buf,
+    index=False
+)
+
 st.download_button(
-    "⬇️ Download processed data as CSV",
+    "Download Processed Dataset",
     data=csv_buf.getvalue(),
     file_name="nids_processed.csv",
     mime="text/csv"
 )
 
-st.caption("Demo: Wireshark Packet-Level Traffic Analysis for Anomaly Detection | Cybersecurity Tools Seminar")
+# =========================================================
+# FOOTER
+# =========================================================
+st.caption(
+    "SentinelX NIDS • ML-Powered Network Intrusion Detection System"
+)
